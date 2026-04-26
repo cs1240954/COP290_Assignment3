@@ -4,14 +4,6 @@
 
 #include "db/db_impl.h"
 
-#include <algorithm>
-#include <atomic>
-#include <cstdint>
-#include <cstdio>
-#include <set>
-#include <string>
-#include <vector>
-
 #include "db/builder.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
@@ -22,11 +14,20 @@
 #include "db/table_cache.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <set>
+#include <string>
+#include <vector>
+
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "leveldb/status.h"
 #include "leveldb/table.h"
 #include "leveldb/table_builder.h"
+
 #include "port/port.h"
 #include "table/block.h"
 #include "table/merger.h"
@@ -1175,6 +1176,63 @@ Iterator* DBImpl::NewIterator(const ReadOptions& options) {
                                   ->sequence_number()
                             : latest_snapshot),
                        seed);
+}
+
+Status DBImpl::Scan(const ReadOptions& options, const Slice& start_key,
+                    const Slice& end_key,
+                    std::vector<std::pair<std::string, std::string>>* result) {
+  if (result == nullptr) {
+    return Status::InvalidArgument("result is null");
+  }
+  result->clear();
+  const Comparator* cmp = user_comparator();
+  if (cmp->Compare(start_key, end_key) >= 0) {
+    return Status::OK();
+  }
+  Iterator* it = NewIterator(options);
+  for (it->Seek(start_key); it->Valid(); it->Next()) {
+    Slice k = it->key();
+    if (cmp->Compare(k, end_key) >= 0) {
+      break;
+    }
+    result->push_back(std::make_pair(k.ToString(), it->value().ToString()));
+  }
+  Status s = it->status();
+  delete it;
+  return s;
+}
+
+Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& start_key,
+                           const Slice& end_key) {
+  const Comparator* cmp = user_comparator();
+  if (cmp->Compare(start_key, end_key) >= 0) {
+    return Status::OK();
+  }
+
+  std::vector<std::string> keys;
+  Iterator* it = NewIterator(ReadOptions());
+  for (it->Seek(start_key); it->Valid(); it->Next()) {
+    Slice k = it->key();
+    if (cmp->Compare(k, end_key) >= 0) {
+      break;
+    }
+    keys.push_back(k.ToString());
+  }
+
+  Status scan_status = it->status();
+  delete it;
+  if (!scan_status.ok()) {
+    return scan_status;
+  }
+  if (keys.empty()) {
+    return Status::OK();
+  }
+
+  WriteBatch batch;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    batch.Delete(Slice(keys[i]));
+  }
+  return Write(options, &batch);
 }
 
 void DBImpl::RecordReadSample(Slice key) {
