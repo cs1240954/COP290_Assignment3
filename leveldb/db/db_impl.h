@@ -5,16 +5,17 @@
 #ifndef STORAGE_LEVELDB_DB_DB_IMPL_H_
 #define STORAGE_LEVELDB_DB_DB_IMPL_H_
 
+#include "db/dbformat.h"
+#include "db/log_writer.h"
+#include "db/snapshot.h"
 #include <atomic>
 #include <deque>
 #include <set>
 #include <string>
 
-#include "db/dbformat.h"
-#include "db/log_writer.h"
-#include "db/snapshot.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
+
 #include "port/port.h"
 #include "port/thread_annotations.h"
 
@@ -42,6 +43,12 @@ class DBImpl : public DB {
   Status Write(const WriteOptions& options, WriteBatch* updates) override;
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override;
+  Status Scan(
+      const ReadOptions& options, const Slice& start_key, const Slice& end_key,
+      std::vector<std::pair<std::string, std::string>>* result) override;
+  Status DeleteRange(const WriteOptions& options, const Slice& start_key,
+                     const Slice& end_key) override;
+  Status ForceFullCompaction() override;
   Iterator* NewIterator(const ReadOptions&) override;
   const Snapshot* GetSnapshot() override;
   void ReleaseSnapshot(const Snapshot* snapshot) override;
@@ -70,6 +77,7 @@ class DBImpl : public DB {
   // Samples are taken approximately once every config::kReadBytesPeriod
   // bytes.
   void RecordReadSample(Slice key);
+  void WaitIfFullCompaction();
 
  private:
   friend class DB;
@@ -203,6 +211,26 @@ class DBImpl : public DB {
   Status bg_error_ GUARDED_BY(mutex_);
 
   CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
+
+  port::Mutex full_compact_mu_;
+  port::CondVar full_compact_cv_;
+  bool full_compaction_active_;
+
+  struct FullCompactionStats {
+    FullCompactionStats()
+        : compaction_count(0),
+          input_files(0),
+          output_files(0),
+          bytes_read(0),
+          bytes_written(0) {}
+    int compaction_count;
+    int64_t input_files;
+    int64_t output_files;
+    int64_t bytes_read;
+    int64_t bytes_written;
+  };
+  FullCompactionStats full_compaction_stats_;
+  FullCompactionStats* full_compaction_stats_collector_;
 };
 
 // Sanitize db options.  The caller should delete result.info_log if
