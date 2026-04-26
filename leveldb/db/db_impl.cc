@@ -1234,7 +1234,6 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& start_key,
   }
   return Write(options, &batch);
 }
-
 void DBImpl::RecordReadSample(Slice key) {
   MutexLock l(&mutex_);
   if (versions_->current()->RecordReadSample(key)) {
