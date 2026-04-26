@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <string>
+#include <vector>
 
 #include "gtest/gtest.h"
 #include "db/db_impl.h"
@@ -614,6 +615,25 @@ TEST_F(DBTest, PutDeleteGet) {
     ASSERT_EQ("v2", Get("foo"));
     ASSERT_LEVELDB_OK(db_->Delete(WriteOptions(), "foo"));
     ASSERT_EQ("NOT_FOUND", Get("foo"));
+  } while (ChangeOptions());
+}
+
+TEST_F(DBTest, ScanBasicEarly) {
+  do {
+    ASSERT_LEVELDB_OK(Put("a", "1"));
+    ASSERT_LEVELDB_OK(Put("b", "2"));
+    ASSERT_LEVELDB_OK(Put("c", "3"));
+
+    std::vector<std::pair<std::string, std::string>> out;
+    ReadOptions ro;
+    ASSERT_LEVELDB_OK(db_->Scan(ro, "a", "d", &out));
+    ASSERT_EQ(3, static_cast<int>(out.size()));
+    ASSERT_EQ("a", out[0].first);
+    ASSERT_EQ("1", out[0].second);
+    ASSERT_EQ("b", out[1].first);
+    ASSERT_EQ("2", out[1].second);
+    ASSERT_EQ("c", out[2].first);
+    ASSERT_EQ("3", out[2].second);
   } while (ChangeOptions());
 }
 
