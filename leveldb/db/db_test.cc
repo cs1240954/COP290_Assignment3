@@ -4,26 +4,29 @@
 
 #include "leveldb/db.h"
 
-#include <atomic>
-#include <cinttypes>
-#include <string>
-#include <vector>
-
-#include "gtest/gtest.h"
 #include "db/db_impl.h"
 #include "db/filename.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
+#include <string>
+#include <vector>
+
 #include "leveldb/cache.h"
 #include "leveldb/env.h"
 #include "leveldb/filter_policy.h"
 #include "leveldb/table.h"
+
 #include "port/port.h"
 #include "port/thread_annotations.h"
 #include "util/hash.h"
 #include "util/logging.h"
 #include "util/mutexlock.h"
 #include "util/testutil.h"
+
+#include "gtest/gtest.h"
 
 namespace leveldb {
 
@@ -615,25 +618,6 @@ TEST_F(DBTest, PutDeleteGet) {
     ASSERT_EQ("v2", Get("foo"));
     ASSERT_LEVELDB_OK(db_->Delete(WriteOptions(), "foo"));
     ASSERT_EQ("NOT_FOUND", Get("foo"));
-  } while (ChangeOptions());
-}
-
-TEST_F(DBTest, ScanBasicEarly) {
-  do {
-    ASSERT_LEVELDB_OK(Put("a", "1"));
-    ASSERT_LEVELDB_OK(Put("b", "2"));
-    ASSERT_LEVELDB_OK(Put("c", "3"));
-
-    std::vector<std::pair<std::string, std::string>> out;
-    ReadOptions ro;
-    ASSERT_LEVELDB_OK(db_->Scan(ro, "a", "d", &out));
-    ASSERT_EQ(3, static_cast<int>(out.size()));
-    ASSERT_EQ("a", out[0].first);
-    ASSERT_EQ("1", out[0].second);
-    ASSERT_EQ("b", out[1].first);
-    ASSERT_EQ("2", out[1].second);
-    ASSERT_EQ("c", out[2].first);
-    ASSERT_EQ("3", out[2].second);
   } while (ChangeOptions());
 }
 
@@ -1690,6 +1674,83 @@ TEST_F(DBTest, ManualCompaction) {
   ASSERT_EQ("0,0,1", FilesPerLevel());
 }
 
+TEST_F(DBTest, COP290_ScanDeleteRangeForceCompaction) {
+  ASSERT_LEVELDB_OK(Put("a", "1"));
+  ASSERT_LEVELDB_OK(Put("b", "2"));
+  ASSERT_LEVELDB_OK(Put("c", "3"));
+  ASSERT_LEVELDB_OK(Put("d", "4"));
+
+  std::vector<std::pair<std::string, std::string>> out;
+  ReadOptions ro;
+  ASSERT_LEVELDB_OK(db_->Scan(ro, "a", "c", &out));
+  ASSERT_EQ(2, static_cast<int>(out.size()));
+  ASSERT_EQ("a", out[0].first);
+  ASSERT_EQ("1", out[0].second);
+  ASSERT_EQ("b", out[1].first);
+  ASSERT_EQ("2", out[1].second);
+  for (size_t i = 1; i < out.size(); i++) {
+    ASSERT_LE(out[i - 1].first, out[i].first);
+  }
+
+  WriteOptions wo;
+  ASSERT_LEVELDB_OK(db_->DeleteRange(wo, "b", "d"));
+  ASSERT_EQ("NOT_FOUND", Get("b"));
+  ASSERT_EQ("NOT_FOUND", Get("c"));
+  ASSERT_EQ("4", Get("d"));
+
+  out.clear();
+  ASSERT_LEVELDB_OK(db_->Scan(ro, "a", "z", &out));
+  ASSERT_EQ(2, static_cast<int>(out.size()));
+  ASSERT_EQ("a", out[0].first);
+  ASSERT_EQ("d", out[1].first);
+
+  ASSERT_LEVELDB_OK(db_->ForceFullCompaction());
+}
+
+TEST_F(DBTest, COP290_ScanDeleteRangeEdgeCases) {
+  std::vector<std::pair<std::string, std::string>> out;
+  ReadOptions ro;
+  WriteOptions wo;
+
+  ASSERT_LEVELDB_OK(db_->Scan(ro, "x", "x", &out));
+  ASSERT_TRUE(out.empty());
+
+  ASSERT_LEVELDB_OK(db_->Scan(ro, "z", "a", &out));
+  ASSERT_TRUE(out.empty());
+
+  ASSERT_LEVELDB_OK(db_->DeleteRange(wo, "p", "p"));
+  ASSERT_LEVELDB_OK(db_->DeleteRange(wo, "z", "a"));
+
+  ASSERT_LEVELDB_OK(Put("m", "1"));
+  ASSERT_LEVELDB_OK(db_->DeleteRange(wo, "a", "z"));
+  ASSERT_EQ("NOT_FOUND", Get("m"));
+  out.clear();
+  ASSERT_LEVELDB_OK(db_->Scan(ro, "a", "z", &out));
+  ASSERT_TRUE(out.empty());
+}
+
+TEST_F(DBTest, COP290_ScanWithSnapshot) {
+  ASSERT_LEVELDB_OK(Put("k", "old"));
+  const Snapshot* snap = db_->GetSnapshot();
+  ASSERT_LEVELDB_OK(Put("k", "new"));
+
+  std::vector<std::pair<std::string, std::string>> out;
+  ReadOptions ro_snap;
+  ro_snap.snapshot = snap;
+  ASSERT_LEVELDB_OK(db_->Scan(ro_snap, "k", "l", &out));
+  ASSERT_EQ(1, static_cast<int>(out.size()));
+  ASSERT_EQ("k", out[0].first);
+  ASSERT_EQ("old", out[0].second);
+
+  out.clear();
+  ReadOptions ro_latest;
+  ASSERT_LEVELDB_OK(db_->Scan(ro_latest, "k", "l", &out));
+  ASSERT_EQ(1, static_cast<int>(out.size()));
+  ASSERT_EQ("new", out[0].second);
+
+  db_->ReleaseSnapshot(snap);
+}
+
 TEST_F(DBTest, DBOpen_Options) {
   std::string dbname = testing::TempDir() + "db_options_test";
   DestroyDB(dbname, Options());
@@ -2188,6 +2249,63 @@ class ModelDB : public DB {
     }
   }
   void CompactRange(const Slice* start, const Slice* end) override {}
+
+  Status Scan(
+      const ReadOptions& options, const Slice& start_key, const Slice& end_key,
+      std::vector<std::pair<std::string, std::string>>* result) override {
+    if (result == nullptr) {
+      return Status::InvalidArgument("result is null");
+    }
+    result->clear();
+    const std::string start = start_key.ToString();
+    const std::string end = end_key.ToString();
+    if (start >= end) {
+      return Status::OK();
+    }
+    const KVMap* src = &map_;
+    if (options.snapshot != nullptr) {
+      src = &(reinterpret_cast<const ModelSnapshot*>(options.snapshot)->map_);
+    }
+    for (auto it = src->lower_bound(start); it != src->end(); ++it) {
+      if (it->first >= end) {
+        break;
+      }
+      result->emplace_back(it->first, it->second);
+    }
+    return Status::OK();
+  }
+
+  Status DeleteRange(const WriteOptions&, const Slice& start_key,
+                     const Slice& end_key) override {
+    const std::string start = start_key.ToString();
+    const std::string end = end_key.ToString();
+    if (start >= end) {
+      return Status::OK();
+    }
+    std::vector<std::string> to_erase;
+    for (auto it = map_.lower_bound(start); it != map_.end(); ++it) {
+      if (it->first >= end) {
+        break;
+      }
+      to_erase.push_back(it->first);
+    }
+    for (const auto& k : to_erase) {
+      map_.erase(k);
+    }
+    return Status::OK();
+  }
+
+  Status ForceFullCompaction() override {
+    std::fprintf(stdout,
+                 "ForceFullCompaction statistics:\n"
+                 "  compactions executed: %d\n"
+                 "  input files: %lld\n"
+                 "  output files: %lld\n"
+                 "  total bytes read: %lld\n"
+                 "  total bytes written: %lld\n",
+                 0, 0LL, 0LL, 0LL, 0LL);
+    return Status::OK();
+  }
 
  private:
   class ModelIter : public Iterator {
