@@ -1209,31 +1209,49 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& start_key,
     return Status::OK();
   }
 
-  std::vector<std::string> keys;
-  Iterator* it = NewIterator(ReadOptions());
-  for (it->Seek(start_key); it->Valid(); it->Next()) {
-    Slice k = it->key();
-    if (cmp->Compare(k, end_key) >= 0) {
-      break;
+  const int kMaxPasses = 512;
+  int pass = 0;
+  while (pass < kMaxPasses) {
+    std::vector<std::string> keys;
+    Iterator* it = NewIterator(ReadOptions());
+    it->Seek(start_key);
+    bool stop = false;
+    while (it->Valid()) {
+      Slice k = it->key();
+      if (cmp->Compare(k, end_key) >= 0) {
+        stop = true;
+      } else {
+        keys.push_back(k.ToString());
+        it->Next();
+      }
+      if (stop) {
+        break;
+      }
     }
-    keys.push_back(k.ToString());
+
+    Status scan_status = it->status();
+    delete it;
+    if (!scan_status.ok()) {
+      return scan_status;
+    }
+    if (keys.empty()) {
+      return Status::OK();
+    }
+
+    WriteBatch batch;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      batch.Delete(Slice(keys[i]));
+    }
+    Status s = Write(options, &batch);
+    if (!s.ok()) {
+      return s;
+    }
+    pass++;
   }
 
-  Status scan_status = it->status();
-  delete it;
-  if (!scan_status.ok()) {
-    return scan_status;
-  }
-  if (keys.empty()) {
-    return Status::OK();
-  }
-
-  WriteBatch batch;
-  for (size_t i = 0; i < keys.size(); ++i) {
-    batch.Delete(Slice(keys[i]));
-  }
-  return Write(options, &batch);
+  return Status::Corruption("DeleteRange: range did not empty after retries");
 }
+
 void DBImpl::RecordReadSample(Slice key) {
   MutexLock l(&mutex_);
   if (versions_->current()->RecordReadSample(key)) {
