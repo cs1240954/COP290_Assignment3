@@ -42,11 +42,14 @@ class DBImpl : public DB {
   Status Write(const WriteOptions& options, WriteBatch* updates) override;
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override;
-  Status Scan(
-      const ReadOptions& options, const Slice& start_key, const Slice& end_key,
-      std::vector<std::pair<std::string, std::string>>* result) override;
+  // Scan uses the same iterator visibility rules as regular reads.
+  Status Scan(const ReadOptions& options, const Slice& start_key,
+               const Slice& end_key,
+               std::vector<std::pair<std::string, std::string>>* result) override;
+  // DeleteRange issues tombstones for visible keys in the interval.
   Status DeleteRange(const WriteOptions& options, const Slice& start_key,
                      const Slice& end_key) override;
+  // ForceFullCompaction blocks foreground work during the operation.
   Status ForceFullCompaction() override;
   Iterator* NewIterator(const ReadOptions&) override;
   const Snapshot* GetSnapshot() override;
@@ -76,6 +79,8 @@ class DBImpl : public DB {
   // Samples are taken approximately once every config::kReadBytesPeriod
   // bytes.
   void RecordReadSample(Slice key);
+
+  // Shared wait gate used by foreground APIs.
   void WaitIfFullCompaction();
 
  private:

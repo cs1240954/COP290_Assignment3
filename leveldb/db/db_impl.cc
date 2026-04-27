@@ -554,6 +554,7 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   stats_[level].Add(stats);
   if (full_compaction_stats_collector_ != nullptr && s.ok() &&
       meta.file_size > 0) {
+    // Count this memtable flush in full-compaction statistics.
     FullCompactionStats* const c = full_compaction_stats_collector_;
     c->compaction_count++;
     c->output_files += 1;
@@ -770,6 +771,7 @@ void DBImpl::BackgroundCompaction() {
         static_cast<unsigned long long>(f->file_size),
         status.ToString().c_str(), versions_->LevelSummary(&tmp));
     if (full_compaction_stats_collector_ != nullptr && status.ok()) {
+      // Trivial move still does file IO, so include it in force stats.
       FullCompactionStats* const col = full_compaction_stats_collector_;
       col->compaction_count++;
       col->input_files += 1;
@@ -1074,7 +1076,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     c->compaction_count++;
     c->input_files += compact->compaction->num_input_files(0);
     c->input_files += compact->compaction->num_input_files(1);
-    c->output_files += static_cast<int64_t>(compact->outputs.size());
+    c->output_files +=
+        static_cast<int64_t>(compact->outputs.size());
     c->bytes_read += stats.bytes_read;
     c->bytes_written += stats.bytes_written;
   }
@@ -1235,9 +1238,11 @@ void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
 }
 
 void DBImpl::WaitIfFullCompaction() {
+  // The compaction thread should not block on its own gate.
   if (tls_in_force_full_compaction) {
     return;
   }
+  // Foreground operations wait here while a force compaction is active.
   MutexLock l(&full_compact_mu_);
   while (full_compaction_active_) {
     full_compact_cv_.Wait();
@@ -1256,11 +1261,13 @@ Status DBImpl::Scan(const ReadOptions& options, const Slice& start_key,
   if (cmp->Compare(start_key, end_key) >= 0) {
     return Status::OK();
   }
+  // Use NewIterator so scan sees merged data from memtable and SSTables.
   Iterator* it = NewIterator(options);
   it->Seek(start_key);
   bool stop = false;
   while (it->Valid()) {
     Slice k = it->key();
+    // Stop at end_key to keep the interval half-open: [start_key, end_key).
     if (cmp->Compare(k, end_key) >= 0) {
       stop = true;
     } else {
@@ -1286,11 +1293,11 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& start_key,
   if (cmp->Compare(start_key, end_key) >= 0) {
     return Status::OK();
   }
-
   const int kMaxPasses = 512;
   int pass = 0;
   while (pass < kMaxPasses) {
     std::vector<std::string> keys;
+    // Collect current visible keys in the range, then delete them in a batch.
     Iterator* it = NewIterator(ReadOptions());
     it->Seek(start_key);
     bool stop = false;
@@ -1306,7 +1313,6 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& start_key,
         break;
       }
     }
-
     Status scan_status = it->status();
     delete it;
     if (!scan_status.ok()) {
@@ -1315,7 +1321,6 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& start_key,
     if (keys.empty()) {
       return Status::OK();
     }
-
     WriteBatch batch;
     for (size_t i = 0; i < keys.size(); ++i) {
       batch.Delete(Slice(keys[i]));
@@ -1326,7 +1331,6 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& start_key,
     }
     pass++;
   }
-
   return Status::Corruption("DeleteRange: range did not empty after retries");
 }
 
@@ -1348,6 +1352,7 @@ Status DBImpl::ForceFullCompaction() {
   mutex_.Unlock();
 
   status = TEST_CompactMemTable();
+  // Run compaction level by level and stop each level when no new work appears.
   for (int level = 0; level + 1 < config::kNumLevels; ++level) {
     if (!status.ok()) {
       break;
@@ -1385,6 +1390,7 @@ Status DBImpl::ForceFullCompaction() {
   mutex_.Unlock();
 
   FullCompactionStats out_stats = st;
+  // Report at least one executed step for a force API call.
   if (out_stats.compaction_count == 0) {
     out_stats.compaction_count = 1;
   }

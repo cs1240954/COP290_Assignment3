@@ -1673,6 +1673,7 @@ TEST_F(DBTest, ManualCompaction) {
 }
 
 TEST_F(DBTest, COP290_ScanDeleteRangeForceCompaction) {
+  // Basic integration flow for the three new APIs.
   ASSERT_LEVELDB_OK(Put("a", "1"));
   ASSERT_LEVELDB_OK(Put("b", "2"));
   ASSERT_LEVELDB_OK(Put("c", "3"));
@@ -1706,6 +1707,7 @@ TEST_F(DBTest, COP290_ScanDeleteRangeForceCompaction) {
 }
 
 TEST_F(DBTest, COP290_ScanDeleteRangeEdgeCases) {
+  // Empty and inverted ranges should be treated as no-op success cases.
   std::vector<std::pair<std::string, std::string>> out;
   ReadOptions ro;
   WriteOptions wo;
@@ -1728,6 +1730,7 @@ TEST_F(DBTest, COP290_ScanDeleteRangeEdgeCases) {
 }
 
 TEST_F(DBTest, COP290_ScanWithSnapshot) {
+  // Scan should honor ReadOptions.snapshot the same way Get does.
   ASSERT_LEVELDB_OK(Put("k", "old"));
   const Snapshot* snap = db_->GetSnapshot();
   ASSERT_LEVELDB_OK(Put("k", "new"));
@@ -2248,9 +2251,10 @@ class ModelDB : public DB {
   }
   void CompactRange(const Slice* start, const Slice* end) override {}
 
-  Status Scan(
-      const ReadOptions& options, const Slice& start_key, const Slice& end_key,
-      std::vector<std::pair<std::string, std::string>>* result) override {
+  Status Scan(const ReadOptions& options, const Slice& start_key,
+               const Slice& end_key,
+               std::vector<std::pair<std::string, std::string>>* result) override {
+    // ModelDB scan mirrors [start, end) behavior of DBImpl::Scan.
     if (result == nullptr) {
       return Status::InvalidArgument("result is null");
     }
@@ -2275,6 +2279,7 @@ class ModelDB : public DB {
 
   Status DeleteRange(const WriteOptions&, const Slice& start_key,
                      const Slice& end_key) override {
+    // ModelDB delete-range removes keys currently in the interval.
     const std::string start = start_key.ToString();
     const std::string end = end_key.ToString();
     if (start >= end) {
@@ -2294,6 +2299,7 @@ class ModelDB : public DB {
   }
 
   Status ForceFullCompaction() override {
+    // Model DB has no files, so stats are a fixed zero-work summary.
     std::fprintf(stdout,
                  "ForceFullCompaction statistics:\n"
                  "  compactions executed: %d\n"

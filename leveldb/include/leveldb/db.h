@@ -89,13 +89,16 @@ class LEVELDB_EXPORT DB {
   virtual Status Get(const ReadOptions& options, const Slice& key,
                      std::string* value) = 0;
 
+  // Return visible key-value pairs in [start_key, end_key).
   virtual Status Scan(const ReadOptions& options, const Slice& start_key,
                       const Slice& end_key,
                       std::vector<std::pair<std::string, std::string>>* result) = 0;
 
+  // Logically delete currently visible keys in [start_key, end_key).
   virtual Status DeleteRange(const WriteOptions& options, const Slice& start_key,
                              const Slice& end_key) = 0;
 
+  // Run synchronous full compaction and print compaction statistics.
   virtual Status ForceFullCompaction() = 0;
 
   // Return a heap-allocated iterator over the contents of the database.
