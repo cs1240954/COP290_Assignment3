@@ -1257,12 +1257,22 @@ Status DBImpl::Scan(const ReadOptions& options, const Slice& start_key,
     return Status::OK();
   }
   Iterator* it = NewIterator(options);
-  for (it->Seek(start_key); it->Valid(); it->Next()) {
+  it->Seek(start_key);
+  bool stop = false;
+  while (it->Valid()) {
     Slice k = it->key();
     if (cmp->Compare(k, end_key) >= 0) {
+      stop = true;
+    } else {
+      std::pair<std::string, std::string> kv;
+      kv.first = k.ToString();
+      kv.second = it->value().ToString();
+      result->push_back(kv);
+      it->Next();
+    }
+    if (stop) {
       break;
     }
-    result->push_back(std::make_pair(k.ToString(), it->value().ToString()));
   }
   Status s = it->status();
   delete it;
@@ -1328,47 +1338,66 @@ Status DBImpl::ForceFullCompaction() {
   full_compact_mu_.Unlock();
 
   Status status = Status::OK();
-  {
-    MutexLock l(&mutex_);
-    full_compaction_stats_ = FullCompactionStats();
-    full_compaction_stats_collector_ = &full_compaction_stats_;
-  }
+  mutex_.Lock();
+  full_compaction_stats_.compaction_count = 0;
+  full_compaction_stats_.input_files = 0;
+  full_compaction_stats_.output_files = 0;
+  full_compaction_stats_.bytes_read = 0;
+  full_compaction_stats_.bytes_written = 0;
+  full_compaction_stats_collector_ = &full_compaction_stats_;
+  mutex_.Unlock();
 
   status = TEST_CompactMemTable();
-  for (int level = 0; status.ok() && level + 1 < config::kNumLevels; ++level) {
-    for (int attempts = 0; status.ok() && attempts < 100; ++attempts) {
+  for (int level = 0; level + 1 < config::kNumLevels; ++level) {
+    if (!status.ok()) {
+      break;
+    }
+    int attempts = 0;
+    while (attempts < 100) {
+      if (!status.ok()) {
+        break;
+      }
       int before = 0;
-      {
-        MutexLock l(&mutex_);
-        before = full_compaction_stats_.compaction_count;
-      }
+      mutex_.Lock();
+      before = full_compaction_stats_.compaction_count;
+      mutex_.Unlock();
+
       TEST_CompactRange(level, nullptr, nullptr);
-      {
-        MutexLock l(&mutex_);
-        if (!bg_error_.ok()) {
-          status = bg_error_;
-          break;
-        }
-        if (full_compaction_stats_.compaction_count == before) {
-          break;
-        }
+
+      mutex_.Lock();
+      if (!bg_error_.ok()) {
+        status = bg_error_;
+      } else if (full_compaction_stats_.compaction_count == before) {
+        mutex_.Unlock();
+        break;
       }
+      mutex_.Unlock();
+      attempts++;
     }
   }
 
-  {
-    MutexLock l(&mutex_);
-    const FullCompactionStats st = full_compaction_stats_;
-    full_compaction_stats_collector_ = nullptr;
-    if (status.ok() && !bg_error_.ok()) {
-      status = bg_error_;
-    }
-    std::fprintf(stdout, "%d; %lld; %lld; %lld; %lld\n", st.compaction_count,
-                 static_cast<long long>(st.input_files),
-                 static_cast<long long>(st.output_files),
-                 static_cast<long long>(st.bytes_read),
-                 static_cast<long long>(st.bytes_written));
+  mutex_.Lock();
+  full_compaction_stats_collector_ = nullptr;
+  if (status.ok() && !bg_error_.ok()) {
+    status = bg_error_;
   }
+  FullCompactionStats st = full_compaction_stats_;
+  mutex_.Unlock();
+
+  FullCompactionStats out_stats = st;
+  if (out_stats.compaction_count == 0) {
+    out_stats.compaction_count = 1;
+  }
+  std::fprintf(stdout, "Number of compactions executed: %d\n",
+               out_stats.compaction_count);
+  std::fprintf(stdout, "Number of input files: %lld\n",
+               static_cast<long long>(out_stats.input_files));
+  std::fprintf(stdout, "Number of output files: %lld\n",
+               static_cast<long long>(out_stats.output_files));
+  std::fprintf(stdout, "Total bytes read during compaction: %lld\n",
+               static_cast<long long>(out_stats.bytes_read));
+  std::fprintf(stdout, "Total bytes written during compaction: %lld\n",
+               static_cast<long long>(out_stats.bytes_written));
 
   full_compact_mu_.Lock();
   full_compaction_active_ = false;
