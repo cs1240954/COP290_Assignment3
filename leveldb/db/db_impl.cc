@@ -39,6 +39,7 @@
 namespace leveldb {
 
 const int kNumNonTableCacheFiles = 10;
+thread_local bool tls_in_force_full_compaction = false;
 
 // Information kept for every waiting writer
 struct DBImpl::Writer {
@@ -148,7 +149,10 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
-                               &internal_comparator_)) {}
+                               &internal_comparator_)),
+      full_compact_cv_(&full_compact_mu_),
+      full_compaction_active_(false),
+      full_compaction_stats_collector_(nullptr) {}
 
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
@@ -581,6 +585,7 @@ void DBImpl::CompactMemTable() {
 }
 
 void DBImpl::CompactRange(const Slice* begin, const Slice* end) {
+  WaitIfFullCompaction();
   int max_level_with_files = 1;
   {
     MutexLock l(&mutex_);
@@ -1121,6 +1126,7 @@ int64_t DBImpl::TEST_MaxNextLevelOverlappingBytes() {
 
 Status DBImpl::Get(const ReadOptions& options, const Slice& key,
                    std::string* value) {
+  WaitIfFullCompaction();
   Status s;
   MutexLock l(&mutex_);
   SequenceNumber snapshot;
@@ -1167,6 +1173,7 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
 }
 
 Iterator* DBImpl::NewIterator(const ReadOptions& options) {
+  WaitIfFullCompaction();
   SequenceNumber latest_snapshot;
   uint32_t seed;
   Iterator* iter = NewInternalIterator(options, &latest_snapshot, &seed);
@@ -1178,9 +1185,20 @@ Iterator* DBImpl::NewIterator(const ReadOptions& options) {
                        seed);
 }
 
+void DBImpl::WaitIfFullCompaction() {
+  if (tls_in_force_full_compaction) {
+    return;
+  }
+  MutexLock l(&full_compact_mu_);
+  while (full_compaction_active_) {
+    full_compact_cv_.Wait();
+  }
+}
+
 Status DBImpl::Scan(const ReadOptions& options, const Slice& start_key,
                     const Slice& end_key,
                     std::vector<std::pair<std::string, std::string>>* result) {
+  WaitIfFullCompaction();
   if (result == nullptr) {
     return Status::InvalidArgument("result is null");
   }
@@ -1204,6 +1222,7 @@ Status DBImpl::Scan(const ReadOptions& options, const Slice& start_key,
 
 Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& start_key,
                            const Slice& end_key) {
+  WaitIfFullCompaction();
   const Comparator* cmp = user_comparator();
   if (cmp->Compare(start_key, end_key) >= 0) {
     return Status::OK();
@@ -1252,7 +1271,61 @@ Status DBImpl::DeleteRange(const WriteOptions& options, const Slice& start_key,
   return Status::Corruption("DeleteRange: range did not empty after retries");
 }
 
+Status DBImpl::ForceFullCompaction() {
+  WaitIfFullCompaction();
+  tls_in_force_full_compaction = true;
+  full_compact_mu_.Lock();
+  full_compaction_active_ = true;
+  full_compact_mu_.Unlock();
+
+  Status status = Status::OK();
+  {
+    MutexLock l(&mutex_);
+    full_compaction_stats_ = FullCompactionStats();
+    full_compaction_stats_collector_ = &full_compaction_stats_;
+  }
+
+  status = TEST_CompactMemTable();
+  for (int level = 0; status.ok() && level + 1 < config::kNumLevels; ++level) {
+    for (int attempts = 0; status.ok() && attempts < 100; ++attempts) {
+      int before = 0;
+      {
+        MutexLock l(&mutex_);
+        before = full_compaction_stats_.compaction_count;
+      }
+      TEST_CompactRange(level, nullptr, nullptr);
+      {
+        MutexLock l(&mutex_);
+        if (!bg_error_.ok()) {
+          status = bg_error_;
+          break;
+        }
+        if (full_compaction_stats_.compaction_count == before) {
+          break;
+        }
+      }
+    }
+  }
+
+  {
+    MutexLock l(&mutex_);
+    full_compaction_stats_collector_ = nullptr;
+    if (status.ok() && !bg_error_.ok()) {
+      status = bg_error_;
+    }
+  }
+
+  full_compact_mu_.Lock();
+  full_compaction_active_ = false;
+  full_compact_mu_.Unlock();
+  full_compact_cv_.SignalAll();
+
+  tls_in_force_full_compaction = false;
+  return status;
+}
+
 void DBImpl::RecordReadSample(Slice key) {
+  WaitIfFullCompaction();
   MutexLock l(&mutex_);
   if (versions_->current()->RecordReadSample(key)) {
     MaybeScheduleCompaction();
@@ -1260,11 +1333,13 @@ void DBImpl::RecordReadSample(Slice key) {
 }
 
 const Snapshot* DBImpl::GetSnapshot() {
+  WaitIfFullCompaction();
   MutexLock l(&mutex_);
   return snapshots_.New(versions_->LastSequence());
 }
 
 void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
+  WaitIfFullCompaction();
   MutexLock l(&mutex_);
   snapshots_.Delete(static_cast<const SnapshotImpl*>(snapshot));
 }
@@ -1279,6 +1354,7 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
 }
 
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
+  WaitIfFullCompaction();
   Writer w(&mutex_);
   w.batch = updates;
   w.sync = options.sync;
@@ -1480,6 +1556,7 @@ Status DBImpl::MakeRoomForWrite(bool force) {
 }
 
 bool DBImpl::GetProperty(const Slice& property, std::string* value) {
+  WaitIfFullCompaction();
   value->clear();
 
   MutexLock l(&mutex_);
@@ -1542,6 +1619,7 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
 }
 
 void DBImpl::GetApproximateSizes(const Range* range, int n, uint64_t* sizes) {
+  WaitIfFullCompaction();
   // TODO(opt): better implementation
   MutexLock l(&mutex_);
   Version* v = versions_->current();
