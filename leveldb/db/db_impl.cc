@@ -4,6 +4,14 @@
 
 #include "db/db_impl.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <set>
+#include <string>
+#include <vector>
+
 #include "db/builder.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
@@ -14,20 +22,11 @@
 #include "db/table_cache.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
-#include <algorithm>
-#include <atomic>
-#include <cstdint>
-#include <cstdio>
-#include <set>
-#include <string>
-#include <vector>
-
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "leveldb/status.h"
 #include "leveldb/table.h"
 #include "leveldb/table_builder.h"
-
 #include "port/port.h"
 #include "table/block.h"
 #include "table/merger.h"
@@ -38,8 +37,13 @@
 
 namespace leveldb {
 
-const int kNumNonTableCacheFiles = 10;
+namespace {
+
 thread_local bool tls_in_force_full_compaction = false;
+
+}  // namespace
+
+const int kNumNonTableCacheFiles = 10;
 
 // Information kept for every waiting writer
 struct DBImpl::Writer {
@@ -1210,6 +1214,26 @@ Iterator* DBImpl::NewIterator(const ReadOptions& options) {
                        seed);
 }
 
+void DBImpl::RecordReadSample(Slice key) {
+  WaitIfFullCompaction();
+  MutexLock l(&mutex_);
+  if (versions_->current()->RecordReadSample(key)) {
+    MaybeScheduleCompaction();
+  }
+}
+
+const Snapshot* DBImpl::GetSnapshot() {
+  WaitIfFullCompaction();
+  MutexLock l(&mutex_);
+  return snapshots_.New(versions_->LastSequence());
+}
+
+void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
+  WaitIfFullCompaction();
+  MutexLock l(&mutex_);
+  snapshots_.Delete(static_cast<const SnapshotImpl*>(snapshot));
+}
+
 void DBImpl::WaitIfFullCompaction() {
   if (tls_in_force_full_compaction) {
     return;
@@ -1353,26 +1377,6 @@ Status DBImpl::ForceFullCompaction() {
 
   tls_in_force_full_compaction = false;
   return status;
-}
-
-void DBImpl::RecordReadSample(Slice key) {
-  WaitIfFullCompaction();
-  MutexLock l(&mutex_);
-  if (versions_->current()->RecordReadSample(key)) {
-    MaybeScheduleCompaction();
-  }
-}
-
-const Snapshot* DBImpl::GetSnapshot() {
-  WaitIfFullCompaction();
-  MutexLock l(&mutex_);
-  return snapshots_.New(versions_->LastSequence());
-}
-
-void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
-  WaitIfFullCompaction();
-  MutexLock l(&mutex_);
-  snapshots_.Delete(static_cast<const SnapshotImpl*>(snapshot));
 }
 
 // Convenience methods

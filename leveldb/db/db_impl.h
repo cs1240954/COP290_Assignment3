@@ -5,17 +5,16 @@
 #ifndef STORAGE_LEVELDB_DB_DB_IMPL_H_
 #define STORAGE_LEVELDB_DB_DB_IMPL_H_
 
-#include "db/dbformat.h"
-#include "db/log_writer.h"
-#include "db/snapshot.h"
 #include <atomic>
 #include <deque>
 #include <set>
 #include <string>
 
+#include "db/dbformat.h"
+#include "db/log_writer.h"
+#include "db/snapshot.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
-
 #include "port/port.h"
 #include "port/thread_annotations.h"
 
@@ -213,24 +212,18 @@ class DBImpl : public DB {
   CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
 
   port::Mutex full_compact_mu_;
-  port::CondVar full_compact_cv_;
-  bool full_compaction_active_;
+  port::CondVar full_compact_cv_ GUARDED_BY(full_compact_mu_);
+  bool full_compaction_active_ GUARDED_BY(full_compact_mu_);
 
   struct FullCompactionStats {
-    FullCompactionStats()
-        : compaction_count(0),
-          input_files(0),
-          output_files(0),
-          bytes_read(0),
-          bytes_written(0) {}
-    int compaction_count;
-    int64_t input_files;
-    int64_t output_files;
-    int64_t bytes_read;
-    int64_t bytes_written;
+    int compaction_count = 0;
+    int64_t input_files = 0;
+    int64_t output_files = 0;
+    int64_t bytes_read = 0;
+    int64_t bytes_written = 0;
   };
   FullCompactionStats full_compaction_stats_;
-  FullCompactionStats* full_compaction_stats_collector_;
+  FullCompactionStats* full_compaction_stats_collector_ GUARDED_BY(mutex_);
 };
 
 // Sanitize db options.  The caller should delete result.info_log if
