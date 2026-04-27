@@ -548,6 +548,14 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   stats.micros = env_->NowMicros() - start_micros;
   stats.bytes_written = meta.file_size;
   stats_[level].Add(stats);
+  if (full_compaction_stats_collector_ != nullptr && s.ok() &&
+      meta.file_size > 0) {
+    FullCompactionStats* const c = full_compaction_stats_collector_;
+    c->compaction_count++;
+    c->output_files += 1;
+    c->bytes_read += static_cast<int64_t>(meta.file_size);
+    c->bytes_written += static_cast<int64_t>(meta.file_size);
+  }
   return s;
 }
 
@@ -757,6 +765,14 @@ void DBImpl::BackgroundCompaction() {
         static_cast<unsigned long long>(f->number), c->level() + 1,
         static_cast<unsigned long long>(f->file_size),
         status.ToString().c_str(), versions_->LevelSummary(&tmp));
+    if (full_compaction_stats_collector_ != nullptr && status.ok()) {
+      FullCompactionStats* const col = full_compaction_stats_collector_;
+      col->compaction_count++;
+      col->input_files += 1;
+      col->output_files += 1;
+      col->bytes_read += static_cast<int64_t>(f->file_size);
+      col->bytes_written += static_cast<int64_t>(f->file_size);
+    }
   } else {
     CompactionState* compact = new CompactionState(c);
     status = DoCompactionWork(compact);
@@ -1049,6 +1065,15 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   }
 
   mutex_.Lock();
+  if (full_compaction_stats_collector_ != nullptr) {
+    FullCompactionStats* const c = full_compaction_stats_collector_;
+    c->compaction_count++;
+    c->input_files += compact->compaction->num_input_files(0);
+    c->input_files += compact->compaction->num_input_files(1);
+    c->output_files += static_cast<int64_t>(compact->outputs.size());
+    c->bytes_read += stats.bytes_read;
+    c->bytes_written += stats.bytes_written;
+  }
   stats_[compact->compaction->level() + 1].Add(stats);
 
   if (status.ok()) {
@@ -1309,10 +1334,16 @@ Status DBImpl::ForceFullCompaction() {
 
   {
     MutexLock l(&mutex_);
+    const FullCompactionStats st = full_compaction_stats_;
     full_compaction_stats_collector_ = nullptr;
     if (status.ok() && !bg_error_.ok()) {
       status = bg_error_;
     }
+    std::fprintf(stdout, "%d; %lld; %lld; %lld; %lld\n", st.compaction_count,
+                 static_cast<long long>(st.input_files),
+                 static_cast<long long>(st.output_files),
+                 static_cast<long long>(st.bytes_read),
+                 static_cast<long long>(st.bytes_written));
   }
 
   full_compact_mu_.Lock();
